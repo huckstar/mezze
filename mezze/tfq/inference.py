@@ -25,6 +25,8 @@ import mezze.tfq.filter_fcn as ff
 import scipy.optimize as op
 import numpy as np
 import scipy.linalg as la
+import mezze.random.SchWARMA as sch
+import scipy.signal as si
 
 class ZDephasingFFLearner(object):
     def __init__(self, b_len, a_dim_less_first,worN=8192,A_var=False, B_var=False, c1_var=False,
@@ -47,13 +49,15 @@ class ZDephasingFFLearner(object):
     def YW_est(self, ps, PhiRecon, a_dim_less_first, overdetermined=False):
         S = self.NNLS_recon(ps, PhiRecon)
         Sfull = np.concatenate([S, S[1:][::-1]])
-        R = np.real(np.fft.fft(Sfull)[:len(ps)])
+
+        N = PhiRecon.shape[1]*2
+        R = np.real(np.fft.fft(Sfull)[:len(ps)])/N
 
         if not overdetermined:
             ahat = np.concatenate([[1], -la.pinv(la.toeplitz(R[:a_dim_less_first])) @ R[1:1+a_dim_less_first]])
         else:
             ahat = np.concatenate([[1], -la.pinv(la.toeplitz(R)[:-1, :a_dim_less_first]) @ R[1:]])
-        bhat = np.array([R[0] - np.sum(-ahat[1:] * R[1:1+a_dim_less_first])])
+        bhat = np.sqrt(np.array([R[0] - np.sum(-ahat[1:] * R[1:1+a_dim_less_first])]))
 
         return bhat, ahat
 
@@ -67,6 +71,60 @@ class ZDephasingFFLearner(object):
         P = lambda w, v: 1. / np.sum(
             [np.abs(np.exp(1j * np.arange(len(ps)) * w) @ v[:, i]) ** 2 for i in range(v.shape[1])])
         return lambda w: P(w, vecs[:,:-dim])
+
+    def MA_NNLS_est(self, ps, PhiRecon, b_len):
+
+        S = self.NNLS_recon(ps, PhiRecon)
+        Sfull = np.concatenate([S, S[1:][::-1]])
+
+        N = PhiRecon.shape[1]*2
+        R = np.real(np.fft.fft(Sfull)[:len(ps)])/N
+
+        x0 = np.zeros(b_len)
+        x0[0] = np.sqrt(R[0]+2*np.sum(R[1:]))
+
+        out = op.minimize(lambda x: np.sum((sch.acv_from_b(x)-R[:b_len])**2),x0)
+
+        return out['x']
+
+    def ARMA_cepstrum_est(self, ps, PhiRecon, Phi, b_len, a_len_less_first):
+
+        S = self.NNLS_recon(ps,PhiRecon)
+        Sfull = np.concatenate([S, S[1:][::-1]])
+
+        Sfull[Sfull<=0] = np.min(Sfull[Sfull>0])/10
+
+        cep = np.real(np.fft.ifft(.5*np.log(Sfull)))
+
+        _, a_temp = self.YW_est(ps,PhiRecon, a_len_less_first, True)
+
+
+        t_len = np.maximum(b_len, a_len_less_first+1)
+        b_cep = np.zeros(t_len)
+        a_cep = np.zeros(t_len)
+        a_cep[:a_len_less_first+1]=a_temp
+
+        b_cep[0] = 1
+        for k in range(1,len(b_cep)):
+            b_cep[k] = k*cep[k]-np.sum([m*b_cep[m]*a_cep[k-m] for m in range(1,k)])
+            b_cep[k]+= +np.sum([m*a_cep[m]*b_cep[k-m] for m in range(1,k+1)])
+            b_cep[k]+= np.sum([i*cep[i]*np.sum([a_cep[m]*b_cep[k-i-m] for m in range(0,k)]) for i in range(1,k)])
+            b_cep[k]/=k
+
+        w_cep, h_cep = si.freqz(b_cep,a_cep, worN=len(S), whole=False)
+
+        sigma2 = np.median(S/np.abs(h_cep)**2)
+
+        _, h_cep_full = si.freqz(b_cep,a_cep, worN=Phi.shape[1], whole=True)
+
+        fun = lambda sigma: np.sum((ps-(.5+.5*np.exp(-sigma**2*Phi@np.abs(h_cep_full)**2)))**2)
+
+        out = op.minimize(fun, 1)
+
+        b_cep = b_cep*out['x']
+
+        return b_cep[:b_len], a_cep[:a_len_less_first+1]
+
 
     def set_coeffs(self, **kwargs):
         self.model.layers[-1].set_coeffs(**kwargs)

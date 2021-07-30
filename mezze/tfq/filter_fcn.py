@@ -36,13 +36,15 @@ def get_FTTS_FFs(N=128,worN=8192):
         mod_funs.append(mod_fun)
 
     # This is the filter function matrix for predictions
-    Phi = np.array([np.abs(np.fft.fft(mf, n=worN)) ** 2 / (.5 * worN) for mf in mod_funs])
+    #Phi = np.array([np.abs(np.fft.fft(mf, n=worN)) ** 2 / (.5 * worN) for mf in mod_funs])
+    Phi = np.array([np.abs(np.fft.fft(mf, n=worN)) ** 2 for mf in mod_funs])/worN/2
 
     # For reconstruction
-    PhiRecon = np.array([np.abs(np.fft.fft(mf, N)) ** 2 / (.5 * N) for mf in mod_funs])
+    PhiRecon = np.array([np.abs(np.fft.fft(mf, N)) ** 2 for mf in mod_funs])/N/2 
     PhiRecon = PhiRecon[:, :N // 2]
-    PhiRecon[1:, :] = PhiRecon[1:, :] * 2
-
+    PhiRecon[1:, :] = PhiRecon[1:, :] * 2 # This is the right one...
+    #PhiRecon[:, 1:] = PhiRecon[:, 1:] * 2
+    
     num_gates = np.array([np.sum(np.abs((mf[1:] + 1) / 2 - (mf[:-1] + 1) / 2)) for mf in mod_funs])[:, np.newaxis]
 
     return Phi, PhiRecon, num_gates
@@ -82,12 +84,12 @@ def get_FTTS_circuits(N):
 class SPAM_constraint(tf.keras.constraints.Constraint):
 
     def __call__(self, w):
-        return w * tf.cast(tf.math.logical_and(tf.math.greater_equal(w, 0.0), tf.math.less_equal(w, 0.5)), tf.float32)
+        return w * tf.cast(tf.math.logical_and(tf.math.greater_equal(w, 0.0), tf.math.less_equal(w, 1)), tf.float32)
 
 
 class SchWARMAZDephasingFF(tf.keras.layers.Layer):
     def __init__(self, b_dim, a_dim_less_first, w, A_var=False, B_var=False, c1_var=False,
-                 c2_var=False, b_back=[0, ], a_back=[1, ], **kwargs):
+                 c2_var=False, b_back=[0, ], a_back=[1, ], rdtype=tf.float32, **kwargs):
         self.b_dim = b_dim
         self.a_dim_less_first = a_dim_less_first
         self.a_dim = a_dim_less_first + 1
@@ -95,7 +97,8 @@ class SchWARMAZDephasingFF(tf.keras.layers.Layer):
         self.B_var = B_var
         self.c1_var = c1_var
         self.c2_var = c2_var
-        self.w = w
+        #self.w = w
+        #self.worN
 
         if b_back is None:
             self.b_back = [0, ]
@@ -107,11 +110,27 @@ class SchWARMAZDephasingFF(tf.keras.layers.Layer):
         else:
             self.a_back = a_back
 
-        if type(w) == int:
-            w, _ = si.freqz([.1], [1], worN=w, whole=True)
-        self.iw = tf.constant(-1j * w, dtype=tf.complex64)
-        rb = tf.constant(np.arange(self.b_dim), dtype=tf.complex64)
-        ra = tf.constant(np.arange(self.a_dim), dtype=tf.complex64)
+        try:
+            if type(w) == int:
+                self.worN = w
+                w, _ = si.freqz([.1], [1], worN=w, whole=True)
+            else:
+                self.worN = len(w)
+        except:
+            print('w should be either int or array-like')
+
+        if rdtype==tf.float32:
+            self.rdtype=rdtype
+            self.cdtype=tf.complex64
+        elif rdtype==tf.float64:
+            self.rdtype=rdtype
+            self.cdtype=tf.complex128
+        else:
+            raise ValueError('Should be tf.float32 or tf.float64')
+        
+        self.iw = tf.constant(-1j * w, dtype=self.cdtype)
+        rb = tf.constant(np.arange(self.b_dim), dtype=self.cdtype)
+        ra = tf.constant(np.arange(self.a_dim), dtype=self.cdtype)
         ebw = tf.exp(tf.tensordot(self.iw, rb, axes=0))
         eaw = tf.exp(tf.tensordot(self.iw, ra, axes=0))
         self.rbw = tf.math.real(ebw)
@@ -126,30 +145,30 @@ class SchWARMAZDephasingFF(tf.keras.layers.Layer):
 
         # aa = tf.concat([[1], tf.multiply(-1.0, self.a_back_less_first)],axis=0).numpy()
 
-        _, h = si.freqz(self.b_back, self.a_back, worN=self.w, whole=True)
+        _, h = si.freqz(self.b_back, self.a_back, worN=self.worN, whole=True)
 
-        return tf.constant(np.abs(h) ** 2, dtype=tf.float32)
+        return tf.constant(np.abs(h) ** 2, dtype=self.rdtype)
 
     def build(self, input_shape):
         self.batch_size = input_shape[0]
-        self.b = self.add_weight(name='b', shape=(self.b_dim,), dtype=tf.float32,
+        self.b = self.add_weight(name='b', shape=(self.b_dim,), dtype=self.rdtype,
                                  initializer='normal', trainable=True)
-        self.a_less_first = self.add_weight(name='a_less_first', dtype=tf.float32,
+        self.a_less_first = self.add_weight(name='a_less_first', dtype=self.rdtype,
                                             shape=(self.a_dim_less_first,),
                                             initializer='normal', trainable=True)
 
         self.A = self.add_weight(name='A', shape=(1,),
                                  initializer=tf.keras.initializers.Constant(value=.5), trainable=self.A_var,
-                                 constraint=SPAM_constraint(), dtype=tf.float32)
+                                 constraint=SPAM_constraint(), dtype=self.rdtype)
         self.B = self.add_weight(name='B', shape=(1,),
                                  initializer=tf.keras.initializers.Constant(value=.5), trainable=self.B_var,
-                                 constraint=SPAM_constraint(), dtype=tf.float32)
+                                 constraint=SPAM_constraint(), dtype=self.rdtype)
         self.c1 = self.add_weight(name='c1', shape=(1,),
                                   initializer=tf.keras.initializers.Constant(value=0), trainable=self.c1_var,
-                                  constraint=tf.keras.constraints.NonNeg(), dtype=tf.float32)
+                                  constraint=tf.keras.constraints.NonNeg(), dtype=self.rdtype)
         self.c2 = self.add_weight(name='c2', shape=(1,),
                                   initializer=tf.keras.initializers.Constant(value=0), trainable=self.c2_var,
-                                  constraint=tf.keras.constraints.NonNeg(), dtype=tf.float32)
+                                  constraint=tf.keras.constraints.NonNeg(), dtype=self.rdtype)
 
         self.bgound = self.background_psd()
 
